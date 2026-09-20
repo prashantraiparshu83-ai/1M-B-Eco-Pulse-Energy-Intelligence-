@@ -1,0 +1,303 @@
+================================================================
+EcoPulse AI — Implementation Guide
+================================================================
+
+OVERVIEW
+--------
+EcoPulse AI is an edge-enabled agentic intelligence engine built on
+IBM Granite models. This file describes how to deploy, configure,
+and integrate all three payload processing pipelines.
+
+
+================================================================
+SECTION 1: PREREQUISITES
+================================================================
+
+Hardware / Infrastructure
+  - Edge node with GPU or NPU capable of running IBM Granite (7B or
+    smaller quantized variant recommended for on-device inference)
+  - MQTT broker accessible by all IoT relay controllers
+    (e.g., Mosquitto, IBM Event Streams)
+  - IP cameras or USB-attached cameras covering rooms to monitor
+  - Smart meters with RS-485 / Modbus or camera-readable displays
+
+Software Dependencies
+  - Python 3.10+
+  - ibm-generative-ai SDK  (pip install ibm-generative-ai)
+  - paho-mqtt              (pip install paho-mqtt)
+  - opencv-python          (pip install opencv-python)
+  - Pillow                 (pip install Pillow)
+  - sqlalchemy             (pip install sqlalchemy)
+  - jinja2                 (pip install jinja2)
+  - python-dotenv          (pip install python-dotenv)
+
+Environment Variables (.env)
+  GRANITE_API_KEY=<your-ibm-granite-api-key>
+  GRANITE_MODEL_ID=ibm/granite-13b-chat-v2
+  MQTT_BROKER_HOST=<broker-ip-or-hostname>
+  MQTT_BROKER_PORT=1883
+  MQTT_USERNAME=<optional>
+  MQTT_PASSWORD=<optional>
+  LOCAL_TARIFF_RATE=0.12        # cost per kWh in local currency
+  DB_CONNECTION_STRING=sqlite:///ecopulse.db
+  HOD_EMAIL=hod@university.edu
+
+
+================================================================
+SECTION 2: PROJECT STRUCTURE
+================================================================
+
+ecopulse/
+  main.py                  # Entry point; routes payloads by type
+  config.py                # Loads env vars and global constants
+  pipelines/
+    vision_frame.py        # VISION_FRAME pipeline
+    iot_state_event.py     # IOT_STATE_EVENT pipeline
+    end_of_day_report.py   # END_OF_DAY_REPORT pipeline
+  agents/
+    occupancy_agent.py     # IBM Granite multimodal occupancy detection
+    relay_agent.py         # MQTT relay command publisher
+    report_agent.py        # RAG retrieval + credit + email generation
+  db/
+    models.py              # SQLAlchemy ORM (Room, MeterLog, CreditLedger)
+    seed.py                # Seeds baseline consumption values per room
+  templates/
+    hod_email.md.j2        # Jinja2 template for END_OF_DAY_REPORT email
+  README.md
+  implement.txt
+
+
+================================================================
+SECTION 3: DATABASE SETUP
+================================================================
+
+Step 1 — Initialise the schema:
+  python -m ecopulse.db.models --create-all
+
+Step 2 — Seed baseline consumption data for each room:
+  python -m ecopulse.db.seed
+
+  The seed file expects a CSV at db/baselines.csv with columns:
+    room_id, baseline_kwh_per_day, department, hod_name, credit_balance
+
+  Example row:
+    LAB-101, 18.4, Computer Science, Dr. Anita Sharma, 0
+
+
+================================================================
+SECTION 4: PIPELINE IMPLEMENTATION
+================================================================
+
+------------------------------------------------------------
+4A. VISION_FRAME Pipeline
+------------------------------------------------------------
+
+Input contract:
+  {
+    "payload_type": "VISION_FRAME",
+    "input_data": {
+      "room_id": "LAB-101",
+      "device_type": "cctv_camera",      // or "digital_meter"
+      "image_base64": "<base64_string>"  // JPEG/PNG frame
+    }
+  }
+
+Processing steps:
+  1. Decode base64 image with Pillow.
+  2. Pass image + prompt to IBM Granite Vision endpoint:
+       Prompt: "Does this image show any person present in the room?
+                Return JSON: {occupancy_detected, confidence}"
+  3. If device_type == "digital_meter", add meter-reading extraction
+     to the prompt:
+       Prompt addition: "Also extract the kWh value shown on the
+                         display. Return as meter_kwh_reading (float)."
+  4. Validate and return the strict output JSON.
+  5. Persist occupancy + timestamp to the MeterLog table.
+
+Confidence threshold:
+  Treat occupancy_detected = true only when confidence >= 0.70.
+  Below threshold → occupancy_detected = false with a low-confidence
+  flag added to the response.
+
+------------------------------------------------------------
+4B. IOT_STATE_EVENT Pipeline
+------------------------------------------------------------
+
+Input contract:
+  {
+    "payload_type": "IOT_STATE_EVENT",
+    "input_data": {
+      "room_id": "LAB-101",
+      "occupancy_detected": false,
+      "unoccupied_duration_seconds": 75,
+      "current_power_state": "ON"
+    }
+  }
+
+Processing steps:
+  1. Apply Rule 1:
+       If occupancy_detected == false
+          AND unoccupied_duration_seconds >= 60
+          AND current_power_state == "ON"
+       → target_power_state = "OFF"
+         reason = "Room unoccupied for <N>s. Switching off lights,
+                   fans, and AC to conserve energy."
+
+  2. Apply Rule 2:
+       If occupancy_detected == true
+          AND current_power_state == "OFF"
+       → target_power_state = "ON"
+         reason = "Occupancy detected. Restoring power."
+
+  3. If neither rule fires, return no relay action (null action).
+
+  4. Publish MQTT message:
+       Topic  : campus/room/{room_id}/relay
+       Payload: { "state": "ON"|"OFF", "timestamp": "<ISO8601>" }
+
+  5. Return strict output JSON.
+
+MQTT QoS:
+  Use QoS level 1 (at-least-once) for relay commands to ensure
+  delivery even under intermittent connectivity.
+
+------------------------------------------------------------
+4C. END_OF_DAY_REPORT Pipeline
+------------------------------------------------------------
+
+Input contract:
+  {
+    "payload_type": "END_OF_DAY_REPORT",
+    "input_data": {
+      "room_id": "LAB-101",
+      "date": "2025-07-16",
+      "actual_kwh_used": 11.2
+    }
+  }
+
+Processing steps:
+  1. RAG retrieval — query the DB for:
+       - baseline_kwh_per_day for room_id
+       - current credit_balance for the department
+       - local_tariff_rate from config
+
+  2. Compute metrics:
+       energy_saved    = baseline_kwh - actual_kwh_used
+       cost_saved      = energy_saved * local_tariff_rate
+       co2_reduced_kg  = energy_saved * 0.85
+       credits_earned  = energy_saved * 10
+       new_balance     = existing_balance + credits_earned
+
+  3. Update DB — write new credit_balance for the department.
+
+  4. Generate marketplace recommendations via Granite:
+       Prompt: "Given <credits_earned> credits earned and a total
+                balance of <new_balance>, suggest 3 eco-friendly
+                campus equipment/supply items redeemable from the
+                Campus Green Marketplace with their credit costs."
+
+  5. Render hod_email.md.j2 Jinja2 template with all computed values.
+
+  6. Return the rendered markdown as the final output.
+
+Green Marketplace credit cost reference (sample):
+  - LED Retrofit Kit (classroom)    :  500 credits
+  - Smart Power Strip (6-outlet)    :  300 credits
+  - Reusable Water Bottle Pack (x10):  150 credits
+  - Solar USB Charging Station      :  800 credits
+  - Energy Audit Consultation       : 1200 credits
+
+
+================================================================
+SECTION 5: RUNNING THE SYSTEM
+================================================================
+
+Single payload (CLI):
+  python -m ecopulse.main \
+    --payload-type VISION_FRAME \
+    --input-file payload_vision.json
+
+All three pipelines demo (sequential):
+  python -m ecopulse.main --demo
+
+Continuous edge loop (production):
+  python -m ecopulse.main --watch \
+    --camera-id 0 \
+    --room-id LAB-101 \
+    --poll-interval 10
+
+  Flags:
+    --camera-id       OpenCV camera index or RTSP URL
+    --room-id         Room identifier in the DB
+    --poll-interval   Seconds between vision frame grabs (default 10)
+
+
+================================================================
+SECTION 6: MQTT TOPIC CONVENTIONS
+================================================================
+
+  Subscribe (sensor state in):   campus/room/+/occupancy
+  Publish  (relay commands out):  campus/room/{room_id}/relay
+  Subscribe (meter readings in):  campus/room/+/meter
+
+Payload format for relay topic:
+  { "state": "ON"|"OFF", "source": "ecopulse", "ts": "<ISO8601>" }
+
+
+================================================================
+SECTION 7: SUSTAINABILITY CREDITS LEDGER
+================================================================
+
+Credits are stored per department in the CreditLedger table:
+  Columns: department, date, credits_earned, balance, room_id
+
+Credits never expire. Redemptions must be logged manually through
+the Campus Green Marketplace portal and deducted via:
+  python -m ecopulse.db.redeem \
+    --department "Computer Science" \
+    --credits 500 \
+    --item "LED Retrofit Kit"
+
+
+================================================================
+SECTION 8: TESTING
+================================================================
+
+Unit tests:
+  pytest tests/
+
+Integration test (requires running MQTT broker + DB):
+  pytest tests/integration/ --run-integration
+
+Sample test payloads are provided in tests/fixtures/:
+  - vision_frame_occupied.json
+  - vision_frame_empty.json
+  - iot_state_event_poweroff.json
+  - iot_state_event_poweron.json
+  - end_of_day_report_sample.json
+
+
+================================================================
+SECTION 9: SECURITY NOTES
+================================================================
+
+- Store all secrets in .env; never commit .env to version control.
+- Add .env to .gitignore.
+- Use TLS (port 8883) for MQTT in production; set MQTT_USE_TLS=true.
+- Restrict MQTT broker ACLs so only EcoPulse AI can publish to
+  campus/room/+/relay topics.
+- Camera streams should be on an isolated VLAN.
+
+
+================================================================
+SECTION 10: SUPPORT & CONTRIBUTION
+================================================================
+
+For issues or feature requests, open a ticket in the project
+repository. Follow the existing payload contract schemas strictly
+when contributing new pipeline modules — backward compatibility
+with the three core payload types must be maintained.
+
+================================================================
+END OF IMPLEMENTATION GUIDE
+================================================================
