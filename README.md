@@ -105,3 +105,22 @@ See [`implement.txt`](implement.txt) for a step-by-step guide to deploying and i
 - **Transport:** MQTT (IoT relay messaging)
 - **Data:** Smart meter logs + RAG baseline database
 - **Vision:** CCTV / digital meter camera feeds
+
+
+# Project Visuals
+
+## Room Monitoring
+
+<img width="1819" height="1079" alt="Image" src="https://github.com/user-attachments/assets/c14e266b-cae8-4d68-8ffb-cd6bd8066161" />
+
+## Energy Analytics
+
+<img width="1574" height="1076" alt="Image" src="https://github.com/user-attachments/assets/d90bb10a-9672-4573-b3d7-471c7ba331be" />
+
+## Green Marketplace
+
+<img width="1795" height="1079" alt="Image" src="https://github.com/user-attachments/assets/424cf28d-e494-477b-ab2a-90e7ac08b3eb" />
+
+## HOD Reports
+
+<img width="1825" height="1079" alt="Image" src="https://github.com/user-attachments/assets/1725f9b9-b1f1-406b-8d25-fe91f1941cc4" />
